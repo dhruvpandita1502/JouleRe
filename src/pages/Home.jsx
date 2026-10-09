@@ -102,7 +102,7 @@ const quickLinks = [
     title: "My Impact",
     description:
       "Log your sustainability activities and follow your personal progress.",
-    link: "/my-impact",
+    link: "/impact",
     label: "Track my impact",
     color: "green",
   },

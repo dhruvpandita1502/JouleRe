@@ -15,6 +15,10 @@ import {
   X,
   Sprout,
   ChevronDown,
+  Camera,
+  ImagePlus,
+  ShieldCheck,
+  Clock3,
 } from "lucide-react";
 
 const STORAGE_KEY = "w2e-campus-my-impact-v1";
@@ -162,6 +166,51 @@ function getLevel(points) {
   return { name: "Eco Starter", next: 40, minimum: 0 };
 }
 
+
+// Resize/compress proof photos before storing them in localStorage.
+function compressPhoto(file, maxSize = 900, quality = 0.72) {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+
+    reader.onerror = () => reject(new Error("Could not read that photo."));
+    reader.onload = () => {
+      const image = new Image();
+
+      image.onerror = () => reject(new Error("That image could not be opened."));
+      image.onload = () => {
+        const scale = Math.min(1, maxSize / Math.max(image.width, image.height));
+        const canvas = document.createElement("canvas");
+        canvas.width = Math.max(1, Math.round(image.width * scale));
+        canvas.height = Math.max(1, Math.round(image.height * scale));
+
+        const context = canvas.getContext("2d");
+        if (!context) {
+          reject(new Error("Photo processing is unavailable in this browser."));
+          return;
+        }
+
+        context.drawImage(image, 0, 0, canvas.width, canvas.height);
+        resolve(canvas.toDataURL("image/jpeg", quality));
+      };
+
+      image.src = reader.result;
+    };
+
+    reader.readAsDataURL(file);
+  });
+}
+
+async function getPhotoHash(file) {
+  if (!globalThis.crypto?.subtle) {
+    throw new Error("Secure photo verification is unavailable in this browser. Use localhost or HTTPS.");
+  }
+  const buffer = await file.arrayBuffer();
+  const digest = await globalThis.crypto.subtle.digest("SHA-256", buffer);
+  return Array.from(new Uint8Array(digest))
+    .map((byte) => byte.toString(16).padStart(2, "0"))
+    .join("");
+}
+
 function Impact() {
   const [entries, setEntries] = useState(loadEntries);
   const [period, setPeriod] = useState("30");
@@ -174,6 +223,10 @@ function Impact() {
   const [material, setMaterial] = useState("Organic");
   const [weight, setWeight] = useState("0.5");
   const [route, setRoute] = useState("Biogas / composting");
+  const [proofPhoto, setProofPhoto] = useState(null);
+  const [photoPreview, setPhotoPreview] = useState("");
+  const [isProcessingPhoto, setIsProcessingPhoto] = useState(false);
+  const [photoWeightEstimate, setPhotoWeightEstimate] = useState(null);
 
   const filteredEntries = useMemo(() => {
     if (period === "all") return entries;
@@ -215,8 +268,11 @@ function Impact() {
     );
   }, [filteredEntries]);
 
+  // New entries earn no leaderboard/status points until reviewed.
+  // Existing sample records remain visible as demo data.
   const totalPoints = entries.reduce(
-    (sum, entry) => sum + (Number(entry.points) || 0),
+    (sum, entry) =>
+      sum + ((entry.demo || entry.verified) ? (Number(entry.points) || 0) : 0),
     0
   );
 
@@ -286,46 +342,121 @@ function Impact() {
     }
   }
 
-  function submitEntry(event) {
+  async function submitEntry(event) {
     event.preventDefault();
     setFormError("");
     setNotice("");
-
-    const numericWeight = Number(weight);
 
     if (!description.trim()) {
       setFormError("Enter a description for this entry.");
       return;
     }
 
-    if (
-      !Number.isFinite(numericWeight) ||
-      numericWeight <= 0 ||
-      numericWeight > 1000
-    ) {
-      setFormError("Enter a weight greater than 0 and no more than 1,000 kg.");
+    if (!proofPhoto) {
+      setFormError("Add a photo of the waste so AI can estimate its approximate weight.");
+      return;
+    }
+    if (!photoWeightEstimate) {
+      setFormError("Estimate the weight from your photo before submitting.");
       return;
     }
 
-    const newEntry = {
-      id: crypto.randomUUID
-        ? crypto.randomUUID()
-        : `${Date.now()}-${Math.random()}`,
-      description: description.trim(),
-      material,
-      weight: numericWeight,
-      route,
-      points: POINTS_BY_ROUTE[route],
-      date: new Date().toISOString(),
-      demo: false,
-    };
+    const numericWeight = Number(photoWeightEstimate.estimatedWeightKg);
+    if (!Number.isFinite(numericWeight) || numericWeight <= 0 || numericWeight > 1000) {
+      setFormError("The AI estimate is outside the allowed range. Upload another photo.");
+      return;
+    }
 
-    persistEntries([newEntry, ...entries]);
-    setPeriod("30");
-    setDescription("");
-    setWeight("0.5");
-    setShowForm(false);
-    setNotice("Impact entry added successfully.");
+    setIsProcessingPhoto(true);
+
+    try {
+      const photoData = await compressPhoto(proofPhoto);
+
+      const newEntry = {
+        id: crypto.randomUUID
+          ? crypto.randomUUID()
+          : `${Date.now()}-${Math.random()}`,
+        description: description.trim(),
+        material,
+        weight: Number(photoWeightEstimate.estimatedWeightKg) || numericWeight,
+        weightEstimate: { minKg: photoWeightEstimate.minWeightKg, maxKg: photoWeightEstimate.maxWeightKg, confidence: photoWeightEstimate.confidence, method: "AI photo estimate" },
+        route,
+        // Points are pending until verified; do not grant them from a self-reported weight.
+        points: 0,
+        pendingPoints: POINTS_BY_ROUTE[route],
+        verified: false,
+        verificationStatus: "pending",
+        photo: photoData,
+        photoName: proofPhoto.name || "waste-proof.jpg",
+        photoHash: photoWeightEstimate.photoHash || null,
+        date: new Date().toISOString(),
+        demo: false,
+      };
+
+      persistEntries([newEntry, ...entries]);
+      setPeriod("30");
+      setDescription("");
+      setWeight("");
+      setProofPhoto(null);
+      setPhotoPreview("");
+      setPhotoWeightEstimate(null);
+      setShowForm(false);
+      setNotice("Activity submitted with photo evidence. Green Points will remain pending until the weight and evidence are verified.");
+    } catch (err) {
+      setFormError(err?.message || "Could not prepare the photo. Please try another image.");
+    } finally {
+      setIsProcessingPhoto(false);
+    }
+  }
+
+  async function handleProofPhoto(file) {
+    if (!file) return;
+
+    if (!file.type.startsWith("image/")) {
+      setFormError("Choose an image file from your camera or gallery.");
+      return;
+    }
+
+    if (file.size > 12 * 1024 * 1024) {
+      setFormError("Choose a photo smaller than 12 MB.");
+      return;
+    }
+
+    setFormError("");
+    setProofPhoto(file);
+
+    try {
+      const photoHash = await getPhotoHash(file);
+      const duplicate = entries.some((entry) => entry.photoHash && entry.photoHash === photoHash);
+      if (duplicate) {
+        throw new Error("This exact photo has already been used for an activity. Upload a new photo of the waste.");
+      }
+
+      const preview = await compressPhoto(file, 1200, 0.82);
+      setPhotoPreview(preview);
+      setPhotoWeightEstimate(null);
+      setIsProcessingPhoto(true);
+      const formData = new FormData();
+      formData.append("image", file);
+      const response = await fetch("/api/estimate-weight", { method: "POST", body: formData });
+      const data = await response.json();
+      if (!response.ok) throw new Error(data.error || "AI weight estimation failed.");
+      if (!(Number(data.estimatedWeightKg) > 0)) throw new Error("AI could not estimate a usable weight. Try another photo.");
+      setPhotoWeightEstimate({ ...data, photoHash });
+      setWeight(String(Number(data.estimatedWeightKg).toFixed(2)));
+      if (Array.isArray(data.materials) && data.materials.length) {
+        setMaterial(data.materials[0].label || material);
+        setDescription((current) => current.trim() || data.materials.map((item) => item.label || item.id).join(", "));
+      }
+      setNotice(`AI estimate: ${Number(data.minWeightKg).toFixed(2)}–${Number(data.maxWeightKg).toFixed(2)} kg (${data.confidence || "low"} confidence). Please review before submitting.`);
+    } catch (err) {
+      setProofPhoto(null);
+      setPhotoPreview("");
+      setPhotoWeightEstimate(null);
+      setFormError(err?.message || "Could not analyse this photo. Check that the backend is running.");
+    } finally {
+      setIsProcessingPhoto(false);
+    }
   }
 
   function deleteEntry(id) {
@@ -353,7 +484,10 @@ function Impact() {
         </div>
 
         <button
-          className="impact-add-button"
+          type="button"
+          className={`impact-add-button ${showForm ? "is-form-open" : ""}`}
+          aria-expanded={showForm}
+          aria-controls="log-activity-form"
           onClick={() => {
             setShowForm((current) => !current);
             setFormError("");
@@ -386,7 +520,7 @@ function Impact() {
       )}
 
       {showForm && (
-        <section className="impact-form-card">
+        <section className="impact-form-card impact-form-card-enter" id="log-activity-form">
           <div className="impact-section-heading">
             <div>
               <span className="card-label">NEW ACTIVITY</span>
@@ -395,6 +529,70 @@ function Impact() {
           </div>
 
           <form onSubmit={submitEntry}>
+            <div className="impact-proof-section">
+              <div className="impact-proof-copy">
+                <span className="impact-proof-icon"><ShieldCheck size={19} /></span>
+                <div>
+                  <strong>Photo proof required</strong>
+                  <p>
+                    Upload any clear photo of the waste. AI will identify visible materials and estimate an approximate weight range; no weighing scale is required.
+                  </p>
+                </div>
+              </div>
+
+              <div className="impact-photo-actions">
+                <label className="impact-photo-button">
+                  <Camera size={18} />
+                  <span>Take photo</span>
+                  <input
+                    type="file"
+                    accept="image/*"
+                    capture="environment"
+                    onChange={(event) => handleProofPhoto(event.target.files?.[0])}
+                  />
+                </label>
+                <label className="impact-photo-button impact-photo-button-secondary">
+                  <ImagePlus size={18} />
+                  <span>Upload photo</span>
+                  <input
+                    type="file"
+                    accept="image/*"
+                    onChange={(event) => handleProofPhoto(event.target.files?.[0])}
+                  />
+                </label>
+              </div>
+
+              {photoWeightEstimate && (
+                <div className="impact-ai-weight-result">
+                  <strong>AI estimate: {Number(photoWeightEstimate.estimatedWeightKg).toFixed(2)} kg</strong>
+                  <span>Likely range: {Number(photoWeightEstimate.minWeightKg).toFixed(2)}–{Number(photoWeightEstimate.maxWeightKg).toFixed(2)} kg · {photoWeightEstimate.confidence || "low"} confidence</span>
+                  <small>Approximate visual estimate, not a measured weight. You can edit the value before submitting.</small>
+                </div>
+              )}
+
+              {photoPreview && (
+                <div className="impact-photo-preview">
+                  <img src={photoPreview} alt="Waste evidence preview" />
+                  <div>
+                    <strong>{proofPhoto?.name || "Waste photo attached"}</strong>
+                    <span>Attached as evidence for review</span>
+                    <button
+                      type="button"
+                      className="impact-remove-photo"
+                      onClick={() => {
+                        setProofPhoto(null);
+                        setPhotoPreview("");
+                        setPhotoWeightEstimate(null);
+                        setWeight("");
+                      }}
+                    >
+                      <X size={14} /> Remove photo
+                    </button>
+                  </div>
+                </div>
+              )}
+            </div>
+
             <div className="impact-form-grid">
               <div className="impact-field impact-field-wide">
                 <label htmlFor="impact-description">
@@ -423,16 +621,19 @@ function Impact() {
               </div>
 
               <div className="impact-field">
-                <label htmlFor="impact-weight">Weight (kg)</label>
+                <label htmlFor="impact-weight">AI-estimated weight (kg)</label>
                 <input
                   id="impact-weight"
                   type="number"
                   min="0.001"
                   max="1000"
                   step="any"
-                  value={weight}
-                  onChange={(event) => setWeight(event.target.value)}
+                  value={photoWeightEstimate ? Number(photoWeightEstimate.estimatedWeightKg).toFixed(2) : ""}
+                  readOnly
+                  placeholder="Upload a photo to estimate weight"
+                  aria-describedby="impact-weight-help"
                 />
+                <small id="impact-weight-help" className="impact-weight-help">Set automatically from AI analysis. The submitted weight cannot be manually increased.</small>
               </div>
 
               <div className="impact-field impact-field-wide">
@@ -452,7 +653,8 @@ function Impact() {
             <div className="impact-points-preview">
               <Trophy size={17} />
               <span>
-                This activity earns <strong>{POINTS_BY_ROUTE[route]} Green Points</strong> in the demo.
+                <strong>{POINTS_BY_ROUTE[route]} Green Points available after verification.</strong>
+                <br />Points stay pending until the photo-based estimate and activity are reviewed.
               </span>
             </div>
 
@@ -464,9 +666,9 @@ function Impact() {
               <button className="secondary-button" type="button" onClick={() => setShowForm(false)}>
                 Cancel
               </button>
-              <button className="primary-button" type="submit">
+              <button className="primary-button" type="submit" disabled={isProcessingPhoto}>
                 <Plus size={16} />
-                Save activity
+                {isProcessingPhoto ? "Analysing photo…" : "Submit for verification"}
               </button>
             </div>
           </form>
@@ -677,12 +879,21 @@ function Impact() {
                   <span>
                     {entry.material} · {entry.route} · {formatDate(entry.date)}
                     {entry.demo ? " · Sample" : ""}
+                    {!entry.demo && !entry.verified ? " · Pending verification" : ""}
+                    {entry.verified ? " · Verified" : ""}
+                    {entry.photo ? " · Photo attached" : ""}
                   </span>
                 </div>
 
                 <div className="impact-history-values">
                   <strong>{Number(entry.weight).toFixed(2)} kg</strong>
-                  <span>+{entry.points} pts</span>
+                  {entry.demo || entry.verified ? (
+                    <span>+{entry.points} pts</span>
+                  ) : (
+                    <span className="impact-points-pending">
+                      <Clock3 size={12} /> {entry.pendingPoints || 0} pts pending
+                    </span>
+                  )}
                 </div>
 
                 {!entry.demo && (

@@ -8,9 +8,13 @@ import Dashboard from "./pages/Dashboard";
 import Impact from "./pages/Impact";
 import Leaderboard from "./pages/Leaderboard";
 
+import ScrollToTop from "./components/ScrollToTop";
+
 function App() {
   return (
     <BrowserRouter>
+
+    <ScrollToTop />
 
       <Navbar />
 

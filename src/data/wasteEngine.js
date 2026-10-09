@@ -139,6 +139,15 @@ function identifyMaterials(description) {
   );
 }
 
+export function detectWasteMaterialTypes(description) {
+  if (!description?.trim()) return [];
+
+  return identifyMaterials(description).map((id) => ({
+    id,
+    name: ROUTING[id].label,
+  }));
+}
+
 function toKg(quantity, unit) {
   return unit === "g" ? quantity / 1000 : quantity;
 }
@@ -186,7 +195,13 @@ function allocateMass(materialId, massKg) {
   return result;
 }
 
-export function analyzeCampusWaste(description, quantity, unit = "kg") {
+
+export function analyzeCampusWaste(
+  description,
+  quantity,
+  unit = "kg",
+  materialWeights = null
+) {
   const amount = Number(quantity);
 
   if (!description.trim()) {
@@ -194,7 +209,9 @@ export function analyzeCampusWaste(description, quantity, unit = "kg") {
   }
 
   if (!Number.isFinite(amount) || amount <= 0 || amount > 1000) {
-    throw new Error("Enter a quantity greater than zero and no more than 1,000 kg.");
+    throw new Error(
+      "Enter a quantity greater than zero and no more than 1,000."
+    );
   }
 
   const totalKg = toKg(amount, unit);
@@ -208,24 +225,67 @@ export function analyzeCampusWaste(description, quantity, unit = "kg") {
       totals: null,
       recommendations: [
         "Describe the material more specifically.",
-        "If the waste is mixed, separate it into identifiable material groups.",
+        "Separate mixed waste into identifiable material groups.",
         "Ask the campus waste team to audit unclassified material.",
       ],
     };
   }
 
-  // Demo assumption: total weight is split evenly across detected
-  // material categories until item-level weights are collected.
-  const massPerMaterial = totalKg / ids.length;
+
+  let weightsById = {};
+
+  if (materialWeights) {
+    // Accept both the array format from Analyzer.jsx and the
+    // object format used by the existing engine.
+    const normalizedWeights = Array.isArray(materialWeights)
+      ? Object.fromEntries(
+        materialWeights.map(({ id, weight }) => [id, Number(weight)])
+      )
+      : Object.fromEntries(
+        Object.entries(materialWeights).map(([id, weight]) => [
+          id,
+          Number(weight),
+        ])
+      );
+
+    let enteredTotalKg = 0;
+
+    for (const id of ids) {
+      const weight = normalizedWeights[id];
+
+      if (!Number.isFinite(weight) || weight <= 0) {
+        throw new Error(
+          `Enter a valid weight greater than zero for ${ROUTING[id].label}.`
+        );
+      }
+
+      weightsById[id] = toKg(weight, unit);
+      enteredTotalKg += weightsById[id];
+    }
+
+    const toleranceKg = Math.max(0.001, totalKg * 0.001);
+
+    if (Math.abs(enteredTotalKg - totalKg) > toleranceKg) {
+      throw new Error(
+        `The individual weights add up to ${enteredTotalKg.toFixed(3)} kg, ` +
+        `but your total is ${totalKg.toFixed(3)} kg.`
+      );
+    }
+  } else if (ids.length === 1) {
+    weightsById[ids[0]] = totalKg;
+  } else {
+    throw new Error("Enter the weight of each detected material before analysing.");
+  }
 
   const materials = ids.map((id) => {
     const rules = ROUTING[id];
-    const allocation = allocateMass(id, massPerMaterial);
+    const massKg = weightsById[id];
+    const allocation = allocateMass(id, massKg);
 
     return {
       id,
       name: rules.label,
-      massKg: massPerMaterial,
+      massKg,
       routeAdvice: rules.advice,
       ...allocation,
     };
@@ -245,6 +305,7 @@ export function analyzeCampusWaste(description, quantity, unit = "kg") {
       ]) {
         sum[key] += item[key];
       }
+
       return sum;
     },
     {
@@ -259,12 +320,11 @@ export function analyzeCampusWaste(description, quantity, unit = "kg") {
     }
   );
 
-  const recommendations = [...new Set(ids.map((id) => ROUTING[id].advice))];
-
-  recommendations.push(
-    "Weigh each material separately to improve the accuracy of the allocation.",
-    "Compare predicted routes with actual facility acceptance, contamination, and measured recovery data."
-  );
+  const recommendations = [
+    ...new Set(ids.map((id) => ROUTING[id].advice)),
+    "Verify material weights using a scale for more accurate results.",
+    "Confirm facility acceptance rules and compare estimates with actual recovery data.",
+  ];
 
   return {
     unknown: false,
